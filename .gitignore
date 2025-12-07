@@ -1,0 +1,25 @@
+# Virtual environment
+.venv/
+
+# Dataset folder
+dataset/
+
+# Jupyter notebooks
+*.ipynb
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+*.db
+*.log
+
+# Environment configuration files
+.env
+*.env
+
+# System temporary files
+.DS_Store
+Thumbs.db
