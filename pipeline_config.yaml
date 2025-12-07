@@ -1,0 +1,53 @@
+pipeline:
+  name: "AbalonePipeline"
+  role_arn_env_var: "SAGEMAKER_ROLE_ARN"
+  bucket_env_var: "BUCKET"
+  
+  data:
+    input_uri_suffix: "abalone/input/abalone-dataset.csv"
+    batch_uri_suffix: "abalone/batch/input/abalone-dataset.csv"
+
+  processing:
+    framework_version: "0.23-1"
+    instance_type: "ml.m5.xlarge"
+    instance_count: 1
+    base_job_name: "sklearn-abalone-process"
+
+  training:
+    framework: "xgboost"
+    version: "1.0-1"
+    py_version: "py3"
+    instance_type: "ml.m5.xlarge"
+    instance_count: 1
+    base_job_name: "abalone-train"
+    hyperparameters:
+      objective: "reg:linear"
+      num_round: 50
+      max_depth: 5
+      eta: 0.2
+      gamma: 4
+      min_child_weight: 6
+      subsample: 0.7
+      silent: 0
+
+  evaluation:
+    instance_type: "ml.m5.xlarge"
+    instance_count: 1
+    base_job_name: "script-abalone-eval"
+    threshold_mse: 6.0
+
+  inference:
+    create_model:
+      instance_type: "ml.m5.large"
+      accelerator_type: "ml.eia1.medium"
+    transform:
+      instance_type: "ml.m5.xlarge"
+      instance_count: 1
+    register:
+      model_package_group_name: "AbaloneModelPackageGroupName"
+      approval_status_default: "PendingManualApproval"
+      inference_instances: 
+        - "ml.t2.medium"
+        - "ml.m5.xlarge"
+      transform_instances:
+        - "ml.m5.xlarge"

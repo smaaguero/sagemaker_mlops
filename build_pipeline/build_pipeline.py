@@ -2,6 +2,8 @@ import os
 import boto3
 import sagemaker
 import sagemaker.session
+import yaml
+from pathlib import Path
 from sagemaker.workflow.pipeline_context import PipelineSession
 from sagemaker.workflow.parameters import (
     ParameterInteger,
@@ -28,35 +30,33 @@ from sagemaker.workflow.functions import JsonGet
 from sagemaker.processing import ScriptProcessor
 from sagemaker.workflow.properties import PropertyFile
 
-# TODO:
-# Añadir una session al pipeline cuando tenga todo funcionando.
+# Load configuration
+config_path = Path(__file__).parent.parent / "pipeline_config.yaml"
+with open(config_path) as f:
+    config = yaml.safe_load(f)
 
-MY_BUCKET = os.getenv("BUCKET")
-MY_ROLE = os.getenv("SAGEMAKER_ROLE_ARN")
-input_data_uri = f"s3://{MY_BUCKET}/abalone/input/abalone-dataset.csv"
-batch_data_uri = f"s3://{MY_BUCKET}/abalone/batch/input/abalone-dataset.csv"
-framework_version = "0.23-1"
+# Environment variables
+MY_BUCKET = os.getenv(config["pipeline"]["bucket_env_var"])
+MY_ROLE = os.getenv(config["pipeline"]["role_arn_env_var"])
+
+input_data_uri = f"s3://{MY_BUCKET}/{config['pipeline']['data']['input_uri_suffix']}"
+batch_data_uri = f"s3://{MY_BUCKET}/{config['pipeline']['data']['batch_uri_suffix']}"
 
 # 1. Define the session and role
 region = boto3.Session().region_name
 sagemaker_session = sagemaker.session.Session()
-# role = os.getenv("SAGEMAKER_ROLE_ARN")
 default_bucket = sagemaker_session.default_bucket()
 pipeline_session = PipelineSession()
-model_package_group_name = f"AbaloneModelPackageGroupName"
+model_package_group_name = config["pipeline"]["inference"]["register"]["model_package_group_name"]
 
 # 2. Define pipeline parameters
-# processing_instance_count – The instance count of the processing job.
-# input_data – The Amazon S3 location of the input data.
-# batch_data – The Amazon S3 location of the input data for batch transformation.
-# model_approval_status – The approval status to register the trained model with for CI/CD.
 processing_instance_count = ParameterInteger(
     name="ProcessingInstanceCount",
-    default_value=1
+    default_value=config["pipeline"]["processing"]["instance_count"]
 )
 model_approval_status = ParameterString(
     name="ModelApprovalStatus",
-    default_value="PendingManualApproval"
+    default_value=config["pipeline"]["inference"]["register"]["approval_status_default"]
 )
 input_data = ParameterString(
     name="InputData",
@@ -69,10 +69,10 @@ batch_data = ParameterString(
 
 # 3. Define the SKLearn processor to preprocess the data
 sklearn_processor = SKLearnProcessor(
-    framework_version=framework_version,
-    instance_type="ml.m5.xlarge",
+    framework_version=config["pipeline"]["processing"]["framework_version"],
+    instance_type=config["pipeline"]["processing"]["instance_type"],
     instance_count=processing_instance_count,
-    base_job_name="sklearn-abalone-process",
+    base_job_name=config["pipeline"]["processing"]["base_job_name"],
     sagemaker_session=pipeline_session,
     role=MY_ROLE,
 )
@@ -96,30 +96,22 @@ step_process = ProcessingStep(
 # 4: Define a training step
 model_path = f"s3://{default_bucket}/AbaloneTrain"
 image_uri = sagemaker.image_uris.retrieve(
-    framework="xgboost",
+    framework=config["pipeline"]["training"]["framework"],
     region=region,
-    version="1.0-1",
-    py_version="py3",
-    instance_type="ml.m5.xlarge"
+    version=config["pipeline"]["training"]["version"],
+    py_version=config["pipeline"]["training"]["py_version"],
+    instance_type=config["pipeline"]["training"]["instance_type"]
 )
 xgb_train = Estimator(
     image_uri=image_uri,
-    instance_type="ml.m5.xlarge",
-    instance_count=1,
+    instance_type=config["pipeline"]["training"]["instance_type"],
+    instance_count=config["pipeline"]["training"]["instance_count"],
     output_path=model_path,
     sagemaker_session=pipeline_session,
     role=MY_ROLE,
 )
-xgb_train.set_hyperparameters(
-    objective="reg:linear",
-    num_round=50,
-    max_depth=5,
-    eta=0.2,
-    gamma=4,
-    min_child_weight=6,
-    subsample=0.7,
-    silent=0
-)
+xgb_train.set_hyperparameters(**config["pipeline"]["training"]["hyperparameters"])
+
 train_args = xgb_train.fit(
     inputs={
         "train": TrainingInput(
@@ -146,9 +138,9 @@ step_train = TrainingStep(
 script_eval = ScriptProcessor(
     image_uri=image_uri,
     command=["python3"],
-    instance_type="ml.m5.xlarge",
-    instance_count=1,
-    base_job_name="script-abalone-eval",
+    instance_type=config["pipeline"]["evaluation"]["instance_type"],
+    instance_count=config["pipeline"]["evaluation"]["instance_count"],
+    base_job_name=config["pipeline"]["evaluation"]["base_job_name"],
     sagemaker_session=pipeline_session,
     role=MY_ROLE,
 )
@@ -191,8 +183,8 @@ model = Model(
     role=MY_ROLE,
 )
 inputs = CreateModelInput(
-    instance_type="ml.m5.large",
-    accelerator_type="ml.eia1.medium",
+    instance_type=config["pipeline"]["inference"]["create_model"]["instance_type"],
+    accelerator_type=config["pipeline"]["inference"]["create_model"]["accelerator_type"],
 )
 step_create_model = CreateModelStep(
     name="AbaloneCreateModel",
@@ -203,8 +195,8 @@ step_create_model = CreateModelStep(
 # 7: Define a TransformStep to perform batch transformation
 transformer = Transformer(
     model_name=step_create_model.properties.ModelName,
-    instance_type="ml.m5.xlarge",
-    instance_count=1,
+    instance_type=config["pipeline"]["inference"]["transform"]["instance_type"],
+    instance_count=config["pipeline"]["inference"]["transform"]["instance_count"],
     output_path=f"s3://{default_bucket}/AbaloneTransform"
 )
 step_transform = TransformStep(
@@ -228,8 +220,8 @@ step_register = RegisterModel(
     model_data=step_train.properties.ModelArtifacts.S3ModelArtifacts,
     content_types=["text/csv"],
     response_types=["text/csv"],
-    inference_instances=["ml.t2.medium", "ml.m5.xlarge"],
-    transform_instances=["ml.m5.xlarge"],
+    inference_instances=config["pipeline"]["inference"]["register"]["inference_instances"],
+    transform_instances=config["pipeline"]["inference"]["register"]["transform_instances"],
     model_package_group_name=model_package_group_name,
     approval_status=model_approval_status,
     model_metrics=model_metrics
@@ -242,7 +234,7 @@ cond_lte = ConditionLessThanOrEqualTo(
         property_file=evaluation_report,
         json_path="regression_metrics.mse.value"
     ),
-    right=6.0
+    right=config["pipeline"]["evaluation"]["threshold_mse"]
 )
 step_cond = ConditionStep(
     name="AbaloneMSECond",
@@ -252,7 +244,7 @@ step_cond = ConditionStep(
 )
 
 # Final step: Define the pipeline
-pipeline_name = f"AbalonePipeline"
+pipeline_name = config["pipeline"]["name"]
 pipeline = Pipeline(
     name=pipeline_name,
     parameters=[
@@ -274,8 +266,8 @@ if __name__ == "__main__":
         parameters={
             "InputData": input_data_uri,
             "BatchData": batch_data_uri,
-            "ProcessingInstanceCount": 1,
-            "ModelApprovalStatus": "PendingManualApproval"
+            "ProcessingInstanceCount": config["pipeline"]["processing"]["instance_count"],
+            "ModelApprovalStatus": config["pipeline"]["inference"]["register"]["approval_status_default"]
         },
         execution_display_name = 'ejecucion-prueba-final'
     )
