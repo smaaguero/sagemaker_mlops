@@ -2,7 +2,7 @@ import sagemaker
 from sagemaker.sklearn.processing import SKLearnProcessor
 from sagemaker.xgboost.processing import XGBoostProcessor
 from sagemaker.processing import ProcessingInput, ProcessingOutput
-from sagemaker.workflow.steps import ProcessingStep, TrainingStep, CreateModelStep, TransformStep
+from sagemaker.workflow.steps import ProcessingStep, TrainingStep, CreateModelStep, TransformStep, TuningStep
 from sagemaker.estimator import Estimator
 from sagemaker.inputs import TrainingInput, CreateModelInput, TransformInput
 from sagemaker.model import Model
@@ -13,6 +13,7 @@ from sagemaker.model_metrics import MetricsSource, ModelMetrics
 from sagemaker.workflow.conditions import ConditionLessThanOrEqualTo
 from sagemaker.workflow.condition_step import ConditionStep
 from sagemaker.workflow.functions import JsonGet
+from sagemaker.tuner import HyperparameterTuner, ContinuousParameter, IntegerParameter, CategoricalParameter
 
 def get_processing_step(config, pipeline_session, input_data_param):
     """Creates the processing step."""
@@ -45,9 +46,8 @@ def get_processing_step(config, pipeline_session, input_data_param):
         step_args=processor_args
     )
 
-def get_training_step(config, pipeline_session, region, process_step):
-    """Creates the training step."""
-    
+def get_estimator(config, pipeline_session, region):
+    """Creates the XGBoost estimator."""
     default_bucket = pipeline_session.default_bucket()
     model_path = f"s3://{default_bucket}/AbaloneTrain"
     
@@ -66,8 +66,16 @@ def get_training_step(config, pipeline_session, region, process_step):
         output_path=model_path,
         sagemaker_session=pipeline_session,
         role=config.role_arn,
+        base_job_name=config.training_config["base_job_name"],
     )
     xgb_train.set_hyperparameters(**config.training_config["hyperparameters"])
+    
+    return xgb_train, image_uri
+
+def get_training_step(config, pipeline_session, region, process_step):
+    """Creates the training step."""
+    
+    xgb_train, image_uri = get_estimator(config, pipeline_session, region)
 
     train_args = xgb_train.fit(
         inputs={
@@ -89,6 +97,40 @@ def get_training_step(config, pipeline_session, region, process_step):
     
     return step_train, xgb_train, image_uri
 
+def get_tuning_step(config, estimator, inputs):
+    """Creates the hyperparameter tuning step."""
+    
+    hyperparameter_ranges = {
+        "eta": ContinuousParameter(
+            config.tuning_config["ranges"]["eta"]["min_value"], 
+            config.tuning_config["ranges"]["eta"]["max_value"]
+        ),
+        "max_depth": IntegerParameter(
+            config.tuning_config["ranges"]["max_depth"]["min_value"], 
+            config.tuning_config["ranges"]["max_depth"]["max_value"]
+        ),
+        "min_child_weight": IntegerParameter(
+            config.tuning_config["ranges"]["min_child_weight"]["min_value"], 
+            config.tuning_config["ranges"]["min_child_weight"]["max_value"]
+        )
+    }
+
+    tuner = HyperparameterTuner(
+        estimator=estimator,
+        objective_metric_name=config.tuning_config["objective_metric_name"],
+        objective_type=config.tuning_config["objective_type"],
+        hyperparameter_ranges=hyperparameter_ranges,
+        max_jobs=config.tuning_config["max_jobs"],
+        max_parallel_jobs=config.tuning_config["max_parallel_jobs"],
+    )
+    
+    step_tuning = TuningStep(
+        name="AbaloneTuning",
+        step_args=tuner.fit(inputs=inputs),
+    )
+
+    return step_tuning
+
 def get_evaluation_step(config, pipeline_session, process_step, step_train):
     """Creates the evaluation step."""
     
@@ -107,11 +149,21 @@ def get_evaluation_step(config, pipeline_session, process_step, step_train):
         output_name="evaluation",
         path="evaluation.json"
     )
+    
+    # Check if the step_train is a TuningStep or a TrainingStep to get the model artifact
+    if isinstance(step_train, TuningStep):
+        model_artifact_s3_uri = step_train.get_top_model_s3_uri(
+            top_k=0, 
+            s3_bucket=pipeline_session.default_bucket(),
+            prefix="AbaloneTrain"
+        )
+    else:
+        model_artifact_s3_uri = step_train.properties.ModelArtifacts.S3ModelArtifacts
 
     eval_args = xgboost_processor.run(
         inputs=[
             ProcessingInput(
-                source=step_train.properties.ModelArtifacts.S3ModelArtifacts,
+                source=model_artifact_s3_uri,
                 destination="/opt/ml/processing/model"
             ),
             ProcessingInput(
@@ -138,9 +190,19 @@ def get_evaluation_step(config, pipeline_session, process_step, step_train):
 def get_create_model_step(config, pipeline_session, image_uri, step_train):
     """Creates the create model step."""
     
+    # Check if the step_train is a TuningStep or a TrainingStep to get the model artifact
+    if isinstance(step_train, TuningStep):
+        model_artifact_s3_uri = step_train.get_top_model_s3_uri(
+            top_k=0, 
+            s3_bucket=pipeline_session.default_bucket(),
+            prefix="AbaloneTrain"
+        )
+    else:
+        model_artifact_s3_uri = step_train.properties.ModelArtifacts.S3ModelArtifacts
+
     model = Model(
         image_uri=image_uri,
-        model_data=step_train.properties.ModelArtifacts.S3ModelArtifacts,
+        model_data=model_artifact_s3_uri,
         sagemaker_session=pipeline_session,
         role=config.role_arn,
     )
@@ -172,7 +234,7 @@ def get_transform_step(config, default_bucket, step_create_model, batch_data_par
         inputs=TransformInput(data=batch_data_param)
     )
 
-def get_register_step(config, estimator, step_train, step_eval, model_approval_status_param):
+def get_register_step(config, estimator, step_train, step_eval, model_approval_status_param, pipeline_session):
     """Creates the register model step."""
     
     model_metrics = ModelMetrics(
@@ -184,10 +246,20 @@ def get_register_step(config, estimator, step_train, step_eval, model_approval_s
         )
     )
     
+    # Check if the step_train is a TuningStep or a TrainingStep to get the model artifact
+    if isinstance(step_train, TuningStep):
+        model_artifact_s3_uri = step_train.get_top_model_s3_uri(
+            top_k=0, 
+            s3_bucket=pipeline_session.default_bucket(),
+            prefix="AbaloneTrain"
+        )
+    else:
+        model_artifact_s3_uri = step_train.properties.ModelArtifacts.S3ModelArtifacts
+    
     return RegisterModel(
         name="AbaloneRegisterModel",
         estimator=estimator,
-        model_data=step_train.properties.ModelArtifacts.S3ModelArtifacts,
+        model_data=model_artifact_s3_uri,
         content_types=["text/csv"],
         response_types=["text/csv"],
         inference_instances=config.inference_config["register"]["inference_instances"],

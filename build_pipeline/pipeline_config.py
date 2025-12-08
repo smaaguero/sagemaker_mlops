@@ -57,6 +57,10 @@ class PipelineConfig:
         return self._config["pipeline"]["training"]
 
     @property
+    def tuning_config(self):
+        return self._config["pipeline"]["tuning"]
+
+    @property
     def evaluation_config(self):
         return self._config["pipeline"]["evaluation"]
 

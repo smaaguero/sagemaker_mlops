@@ -3,11 +3,13 @@ import sagemaker
 from sagemaker.workflow.pipeline_context import PipelineSession
 from sagemaker.workflow.parameters import ParameterInteger, ParameterString
 from sagemaker.workflow.pipeline import Pipeline
+from sagemaker.inputs import TrainingInput
 
 from pipeline_config import PipelineConfig
 from pipeline_steps import (
     get_processing_step,
-    get_training_step,
+    get_estimator,
+    get_tuning_step,
     get_evaluation_step,
     get_create_model_step,
     get_transform_step,
@@ -48,20 +50,36 @@ def main():
     # Processing
     step_process = get_processing_step(config, pipeline_session, input_data)
     
-    # Training
-    step_train, xgb_estimator, image_uri = get_training_step(config, pipeline_session, region, step_process)
+    # Training (Estimator Definition)
+    xgb_estimator, image_uri = get_estimator(config, pipeline_session, region)
+
+    # Tuning (Hyperparameter Optimization)
+    step_tuning = get_tuning_step(
+        config, 
+        xgb_estimator, 
+        inputs={
+            "train": TrainingInput(
+                s3_data=step_process.properties.ProcessingOutputConfig.Outputs["train"].S3Output.S3Uri,
+                content_type="text/csv"
+            ),
+            "validation": TrainingInput(
+                s3_data=step_process.properties.ProcessingOutputConfig.Outputs["validation"].S3Output.S3Uri,
+                content_type="text/csv"
+            )
+        }
+    )
     
-    # Evaluation
-    step_eval, evaluation_report = get_evaluation_step(config, pipeline_session, step_process, step_train)
+    # Evaluation (using the best model from tuning)
+    step_eval, evaluation_report = get_evaluation_step(config, pipeline_session, step_process, step_tuning)
     
-    # Create Model (for transform)
-    step_create_model = get_create_model_step(config, pipeline_session, image_uri, step_train)
+    # Create Model (using the best model from tuning)
+    step_create_model = get_create_model_step(config, pipeline_session, image_uri, step_tuning)
     
     # Transform
     step_transform = get_transform_step(config, default_bucket, step_create_model, batch_data)
     
-    # Register
-    step_register = get_register_step(config, xgb_estimator, step_train, step_eval, model_approval_status)
+    # Register (using the best model from tuning)
+    step_register = get_register_step(config, xgb_estimator, step_tuning, step_eval, model_approval_status, pipeline_session)
     
     # Condition
     step_cond = get_condition_step(
@@ -82,7 +100,7 @@ def main():
             input_data,
             batch_data,
         ],
-        steps=[step_process, step_train, step_eval, step_cond],
+        steps=[step_process, step_tuning, step_eval, step_cond],
         sagemaker_session=sagemaker_session,
     )
 
@@ -96,7 +114,7 @@ def main():
             "ProcessingInstanceCount": config.processing_config["instance_count"],
             "ModelApprovalStatus": config.approval_status_default
         },
-        execution_display_name='ejecucion-prueba-refactorizada'
+        execution_display_name='ejecucion-prueba-tuning'
     )
     
     print(f"Pipeline execution started: {execution.arn}")

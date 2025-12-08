@@ -30,6 +30,22 @@ pipeline:
       subsample: 0.7
       silent: 0
 
+  tuning:
+    objective_metric_name: "validation:rmse"
+    objective_type: "Minimize"
+    max_jobs: 3
+    max_parallel_jobs: 2
+    ranges:
+      eta:
+        min_value: 0.1
+        max_value: 0.5
+      max_depth:
+        min_value: 3
+        max_value: 10
+      min_child_weight:
+        min_value: 1
+        max_value: 10
+
   evaluation:
     instance_type: "ml.m5.xlarge"
     instance_count: 1
