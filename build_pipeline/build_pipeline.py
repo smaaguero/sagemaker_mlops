@@ -1,5 +1,6 @@
 import boto3
 import sagemaker
+from sagemaker.local import LocalSession
 from sagemaker.workflow.pipeline_context import PipelineSession
 from sagemaker.workflow.parameters import ParameterInteger, ParameterString
 from sagemaker.workflow.pipeline import Pipeline
@@ -23,7 +24,19 @@ def main():
     region = boto3.Session().region_name
     sagemaker_session = sagemaker.session.Session()
     default_bucket = sagemaker_session.default_bucket()
-    pipeline_session = PipelineSession()
+    
+    if config.run_mode == 'local':
+        print("Running in LOCAL mode (Sequential Execution)")
+        pipeline_session = LocalSession()
+        pipeline_session.config = {'local': {'local_code': True}}
+        # Override instance types for local execution
+        config.processing_config["instance_type"] = "local"
+        config.training_config["instance_type"] = "local"
+        config.evaluation_config["instance_type"] = "local"
+        config.inference_config["create_model"]["instance_type"] = "local"
+        config.inference_config["transform"]["instance_type"] = "local"
+    else:
+        pipeline_session = PipelineSession()
     
     # 2. Define Pipeline Parameters
     input_data_uri = f"s3://{config.bucket_name}/{config.input_data_uri_suffix}"
@@ -52,12 +65,25 @@ def main():
     
     # Training (Estimator Definition)
     xgb_estimator, image_uri = get_estimator(config, pipeline_session, region)
-
-    # Tuning (Hyperparameter Optimization)
-    step_tuning = get_tuning_step(
-        config, 
-        xgb_estimator, 
-        inputs={
+    
+    # Handle Data dependency logic depending on mode
+    if config.run_mode == 'local':
+        # In local mode with old SDK, steps run eagerly. We need to manually construct inputs from previous job results.
+        # step_process is actually the Processor object (after run) or we need to fetch the job.
+        # Note: This logic requires pipeline_steps.py to return the object, not the Step, when in local mode.
+        
+        # This part assumes pipeline_steps.py has been updated to handle non-PipelineSession
+        train_input_uri = step_process.latest_job.outputs[0].destination
+        validation_input_uri = step_process.latest_job.outputs[1].destination
+        test_input_uri = step_process.latest_job.outputs[2].destination
+        
+        training_inputs = {
+            "train": TrainingInput(s3_data=train_input_uri, content_type="text/csv"),
+            "validation": TrainingInput(s3_data=validation_input_uri, content_type="text/csv")
+        }
+    else:
+        # Remote mode: Use Property files
+        training_inputs = {
             "train": TrainingInput(
                 s3_data=step_process.properties.ProcessingOutputConfig.Outputs["train"].S3Output.S3Uri,
                 content_type="text/csv"
@@ -67,6 +93,12 @@ def main():
                 content_type="text/csv"
             )
         }
+
+    # Tuning (Hyperparameter Optimization)
+    step_tuning = get_tuning_step(
+        config, 
+        xgb_estimator, 
+        inputs=training_inputs
     )
     
     # Evaluation (using the best model from tuning)
@@ -92,32 +124,35 @@ def main():
     )
 
     # 4. Pipeline Definition
-    pipeline = Pipeline(
-        name=config.pipeline_name,
-        parameters=[
-            processing_instance_count,
-            model_approval_status,
-            input_data,
-            batch_data,
-        ],
-        steps=[step_process, step_tuning, step_eval, step_cond],
-        sagemaker_session=sagemaker_session,
-    )
+    if config.run_mode != 'local':
+        pipeline = Pipeline(
+            name=config.pipeline_name,
+            parameters=[
+                processing_instance_count,
+                model_approval_status,
+                input_data,
+                batch_data,
+            ],
+            steps=[step_process, step_tuning, step_eval, step_cond],
+            sagemaker_session=sagemaker_session,
+        )
 
-    # 5. Pipeline Upsert and Execution
-    pipeline.upsert(role_arn=config.role_arn)
-    
-    execution = pipeline.start(
-        parameters={
-            "InputData": input_data_uri,
-            "BatchData": batch_data_uri,
-            "ProcessingInstanceCount": config.processing_config["instance_count"],
-            "ModelApprovalStatus": config.approval_status_default
-        },
-        execution_display_name='ejecucion-prueba-tuning'
-    )
-    
-    print(f"Pipeline execution started: {execution.arn}")
+        # 5. Pipeline Upsert and Execution
+        pipeline.upsert(role_arn=config.role_arn)
+        
+        # execution = pipeline.start(
+        #     parameters={
+        #         "InputData": input_data_uri,
+        #         "BatchData": batch_data_uri,
+        #         "ProcessingInstanceCount": config.processing_config["instance_count"],
+        #         "ModelApprovalStatus": config.approval_status_default
+        #     },
+        #     execution_display_name='ejecucion-prueba-tuning'
+        # )
+        
+        # print(f"Pipeline execution started: {execution.arn}")
+    else:
+        print("Local execution completed (sequential steps).")
 
 if __name__ == "__main__":
     main()

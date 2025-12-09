@@ -25,6 +25,10 @@ class PipelineConfig:
         return self._config["pipeline"]["name"]
     
     @property
+    def run_mode(self):
+        return self._config["pipeline"].get("run_mode", "remote")
+    
+    @property
     def role_arn(self):
         env_var = self._config["pipeline"]["role_arn_env_var"]
         role = os.getenv(env_var)

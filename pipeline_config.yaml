@@ -1,5 +1,6 @@
 pipeline:
   name: "AbalonePipeline"
+  run_mode: "remote"
   role_arn_env_var: "SAGEMAKER_ROLE_ARN"
   bucket_env_var: "BUCKET"
   
